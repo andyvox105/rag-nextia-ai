@@ -1,0 +1,32 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment and Secrets
+.env
+.env.*
+!.env.example
+
+# Databases & Indexes
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.db
+
+# OS / Editor specific
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.idea/
+.vscode/
+*.swp
+*.swo
