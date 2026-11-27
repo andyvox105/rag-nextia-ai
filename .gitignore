@@ -30,3 +30,8 @@ htmlcov/
 .vscode/
 *.swp
 *.swo
+
+# Local agent skills & tooling
+.agents/
+.claude/
+skills-lock.json

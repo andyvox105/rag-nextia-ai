@@ -3,21 +3,38 @@
     python -m policy_assistant inventory                    the documents, their versions, owners and access labels
     python -m policy_assistant questions [--kind KIND]      Grace's question set
     python -m policy_assistant parse FILE                   what the parser reads from a .md, .html or .pdf file
-    python -m policy_assistant ingest [--chunker structure]
+    python -m policy_assistant ingest [--chunker structure] [--embedder NAME|none]
     python -m policy_assistant chunks DOC_ID [--version V]  the chunks of a document and where they come from
-    python -m policy_assistant search "QUESTION" [--k 5]    keyword search (BM25) over the chunks
-    python -m policy_assistant eval [--k 5]                 hit@k on the question set
+    python -m policy_assistant search "QUESTION" [--method rerank] [--k 5] [--as-of DATE|none] [--audience staff] [--rewrite]
+    python -m policy_assistant eval [--method rerank] [--k 5] [--rewrite]
 
-The index is index.sqlite in the project folder (--index PATH for another one).
+The index is index.sqlite in the project folder (--index PATH for another one). Dates are YYYY-MM-DD.
+Without --as-of, the course's date (2026-10-09) is used, so that your results match the lessons;
+use --as-of today for real use.
 """
 
 import argparse
+import re
 import sys
+from datetime import date
 from pathlib import Path
 
 from .documents import CORPUS, PROJECT, load_inventory
 
+COURSE_DATE = "2026-10-09"
 INDEX = PROJECT / "index.sqlite"
+
+
+def as_of(value: str | None) -> str | None:
+    if value in (None, ""):
+        return COURSE_DATE
+    if value == "none":
+        return None
+    if value == "today":
+        return date.today().isoformat()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise SystemExit(f"--as-of must be YYYY-MM-DD, today or none, not {value!r}")
+    return value
 
 
 def short(text: str, n: int = 90) -> str:
@@ -58,6 +75,14 @@ def cmd_parse(args) -> None:
 
 # ---------------------------------------------------------------- index
 
+def make_embedder(name: str):
+    if name == "none":
+        return None
+    from .embed import make_embedder as make
+
+    return make(name)
+
+
 def open_store(args):
     from .store import Store
 
@@ -65,13 +90,6 @@ def open_store(args):
     if not path.exists():
         raise SystemExit(f"No index at {path}. Run: python -m policy_assistant ingest")
     return Store(path)
-
-
-def make_embedder(name: str):
-    if name == "none":
-        return None
-    from .embed import make_embedder as make
-    return make(name)
 
 
 def cmd_ingest(args) -> None:
@@ -98,29 +116,81 @@ def cmd_chunks(args) -> None:
     print(f"{len(chunks)} chunks ({chunks[0].chunker}) from {chunks[0].source}")
 
 
+def make_retriever(args, store):
+    from .rerank import Reranker
+    from .search import Retriever
+
+    meta = store.meta()
+    embedder = None
+    if args.method in ("dense", "hybrid", "rerank"):
+        embedder = make_embedder(args.embedder or meta.get("embedding_model") or "none")
+        if embedder is None:
+            raise SystemExit("This index has no embeddings. Run: python -m policy_assistant ingest")
+    return Retriever(store, embedder, Reranker() if args.method == "rerank" else None)
+
+
 def cmd_search(args) -> None:
+    from .filters import Filters
+    from .store import IndexMismatch
+
     store = open_store(args)
-    for hit in store.keywords.search(args.query, args.k):
-        c = store.chunk(hit.id)
-        print(f"{hit.rank}. {hit.score:>8.4f}  [{c.chunk_id}] {c.doc_id} v{c.version} | {short(c.section, 30)} | {c.access}")
+    retriever = make_retriever(args, store)
+    filters = Filters(as_of=as_of(args.as_of), audience=args.audience)
+    query = args.query
+    if args.rewrite:
+        from .config import Settings
+        from .rewrite import rewrite
+
+        settings = Settings.from_env()
+        query = rewrite(args.query, make_provider(args, settings), model=settings.model)
+        print(f"Rewritten query: {query}")
+    try:
+        results = retriever.search(query, args.method, args.k, filters)
+    except IndexMismatch as e:
+        raise SystemExit(str(e))
+    for r in results:
+        c = r.chunk
+        print(f"{r.rank}. {r.score:>8.4f}  [{c.chunk_id}] {c.doc_id} v{c.version} | {short(c.section, 30)} | {c.access}")
         print(f"   {short(c.text.split(chr(10), 1)[-1], 100)}")
-    print(f"BM25 over {len(store.chunks())} chunks ({store.meta().get('chunker')}), top {args.k}")
+    print(f"{args.method}, top {args.k}, as of {filters.as_of or 'any date'}, audience {filters.audience}")
+
+
+# ---------------------------------------------------------------- the model (query rewriting)
+
+def make_provider(args, settings=None):
+    from .config import Settings, make_provider as make
+
+    return make(settings or Settings.from_env())
 
 
 def cmd_eval(args) -> None:
     from .evaluate import by_kind, load_questions, retrieval_scores, summarise
+    from .filters import Filters
 
     store = open_store(args)
+    retriever = make_retriever(args, store)
+    rewriter, rewrite_model = None, None
+    if args.rewrite:
+        from .config import Settings
+
+        settings = Settings.from_env()
+        rewriter, rewrite_model = make_provider(args, settings), settings.model
     rows = []
     for q in load_questions().values():
-        ranked = [store.chunk(h.id) for h in store.keywords.search(q.question, args.k)]
-        rows.append(retrieval_scores(q, ranked, args.k))
+        filters = Filters(as_of=q.as_of, audience=args.audience)
+        query = q.question
+        if rewriter:
+            from .rewrite import rewrite
+
+            query = rewrite(q.question, rewriter, model=rewrite_model) or q.question
+        results = retriever.search(query, args.method, args.k, filters)
+        rows.append(retrieval_scores(q, [r.chunk for r in results], args.k))
     s = summarise(rows)
-    print(f"BM25 over {store.meta().get('chunker')} chunks, top {args.k}: hit@{args.k} {s['hit']:.3f} "
-          f"({s['questions']} questions with relevant passages)")
+    print(f"{args.method}, top {args.k}, audience {args.audience}: hit@{args.k} {s['hit']:.3f}, "
+          f"MRR@{args.k} {s['mrr']:.3f} ({s['questions']} questions with relevant passages)")
     for kind, k in by_kind(rows).items():
         if k["questions"]:
-            print(f"  {kind:15} {k['questions']:>3} questions, hit@{args.k} {k['hit']:.3f}")
+            print(f"  {kind:15} {k['questions']:>3} questions, hit@{args.k} {k['hit']:.3f}, MRR@{args.k} {k['mrr']:.3f}")
     print(f"missed: {', '.join(r['id'] for r in rows if r['scored'] and not r['hit'])}")
 
 
@@ -136,8 +206,19 @@ def main(argv=None) -> None:
     s.add_argument("--embedder", default="intfloat/multilingual-e5-small",
                    help="a sentence-transformers model, embed-small (recorded vectors) or none")
     s = sub.add_parser("chunks"); s.add_argument("doc_id"); s.add_argument("--version")
-    s = sub.add_parser("search"); s.add_argument("query"); s.add_argument("--k", type=int, default=5)
-    s = sub.add_parser("eval"); s.add_argument("--k", type=int, default=5)
+    for name in ("search", "eval"):
+        s = sub.add_parser(name)
+        if name == "search":
+            s.add_argument("query")
+        s.add_argument("--method", default="rerank", choices=["bm25", "dense", "hybrid", "rerank"])
+        s.add_argument("--k", type=int, default=5)
+        s.add_argument("--audience", default="staff", choices=["staff", "public"])
+        s.add_argument("--embedder", default=None, help="default: the model that built the index")
+        if name == "search":
+            s.add_argument("--as-of", default=None, help="YYYY-MM-DD, today, or none (no date filter); "
+                           "for a question ID, its own date by default")
+        if name in ("search", "eval"):
+            s.add_argument("--rewrite", action="store_true", help="search with a model's rewrite of the question")
     args = p.parse_args(argv)
     {"inventory": cmd_inventory, "questions": cmd_questions, "parse": cmd_parse, "ingest": cmd_ingest,
      "chunks": cmd_chunks, "search": cmd_search, "eval": cmd_eval}[args.command](args)

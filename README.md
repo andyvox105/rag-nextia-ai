@@ -2,7 +2,7 @@
 
 A Retrieval-Augmented Generation (RAG) system built from first principles to answer employee questions using Larkfield's enterprise policy documentation with strict citations and zero hallucination.
 
-In this repository, I document my hands-on journey exploring and implementing each component of the RAG pipeline—from raw document ingestion and parsing to lexical search (BM25), dense semantic retrieval (vector embeddings), cross-lingual support, and quantitative evaluation.
+In this repository, I document my hands-on journey exploring and implementing each component of the RAG pipeline—from raw document ingestion and parsing to lexical search (BM25), dense semantic retrieval (vector embeddings), hybrid fusion (RRF), cross-encoder reranking, optional LLM query rewriting, and quantitative evaluation (`hit@k`, `MRR@k`).
 
 ---
 
@@ -22,26 +22,31 @@ In this repository, I document my hands-on journey exploring and implementing ea
           ├── Overlapping windows
           └── Structure-aware chunking (Heading-based)
                              │
+                             ▼
+              [ 3. Optional LLM Query Rewriting ]
+         (Mock replay / OpenAI-compatible: Ollama, Gemini, OpenAI)
+                             │
+                             ▼
+              [ 4. Metadata & Access Pre-Filtering ]
+               (as_of effective date & staff vs public)
+                             │
              ┌───────────────┴───────────────┐
              ▼                               ▼
    [ Lexical Index ]                 [ Dense Index ]
   SQLite FTS5 (BM25)             multilingual-e5-small
-                                (NumPy Cosine Similarity)
+    (Top 20 hits)               (NumPy Cosine, Top 20)
              │                               │
              └───────────────┬───────────────┘
                              ▼
-                     [ Hybrid Search ]
-              (Reciprocal Rank Fusion - RRF)
+                     [ 5. Hybrid Search ]
+              (Reciprocal Rank Fusion - RRF, Top 20)
                              │
                              ▼
-             [ Metadata & Access Filtering ]
-              (as_of date & staff vs public)
+                 [ 6. Cross-Encoder Rerank ]
+         (mmarco-mMiniLMv2-L12-H384-v1 → Top 5)
                              │
                              ▼
-                  [ Cross-Encoder Rerank ] (Next step)
-                             │
-                             ▼
-             [ Context Assembly & Generation ] (Next step)
+             [ 7. Context Assembly & Generation ] (Next step)
              (Strict citation & refusal on missing data)
 ```
 
@@ -79,38 +84,62 @@ Explored and benchmarked three distinct chunking algorithms:
 - Implemented temporal filtering (`as_of` date vs `effective_from` / `effective_to`) to answer policy questions as of a particular date.
 - Enforced document permission gating (`staff` vs `public` audience) to ensure unprivileged queries never receive restricted company policies.
 
-### 7. Empirical Observations & Key Learnings
-- **Table vs. Prose Representation**: Small embedding models (e.g., e5-small) can struggle with dense Markdown tables compared to natural prose, sometimes favoring distractor passages that sound linguistically fluent. Larger models (or BM25) significantly alleviate this issue.
-- **Cross-Lingual Retrieval**: Verified that semantic embeddings bridge language gaps, achieving high cosine similarity (`>0.81`) between English refund queries and French refund policy clauses without translation.
-- **The Case for Hybrid Search**: Lexical BM25 excels at exact technical identifiers and product SKUs (`sprinklers`, `HT-550`), whereas Dense Retrieval excels at synonym matching (`money back` $\leftrightarrow$ `refund`). Combining them is the optimal path forward.
+### 7. Cross-Encoder Reranking & Unified Retriever (`policy_assistant/rerank.py`, `policy_assistant/search.py`)
+- Built a unified `Retriever` entry point orchestrating `bm25`, `dense`, `hybrid`, and `rerank` with pre-filtering (`as_of`, `audience`) applied before ranking.
+- Added a second-stage multilingual cross-encoder (`cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`) that jointly reads `(query, chunk)` pairs over the top 20 hybrid candidates to re-score and select the top 5 evidence chunks.
+
+### 8. Optional LLM Query Rewriting & Provider Layer (`policy_assistant/rewrite.py`, `config.py`, `providers.py`)
+- Added optional `--rewrite` query rewriting driven by `policy_assistant/prompts/rewrite.md` to translate/normalize colloquial or French questions into English policy terminology while preserving product codes and dates.
+- Built a clean provider abstraction (`MockProvider` replaying `recordings/rewrites.jsonl` for offline/reproducible runs, and `OpenAICompatibleProvider` supporting local Ollama, Google Gemini, or OpenAI APIs configured via `.env`).
+
+### 9. Quantitative Evaluation & Benchmark Results (`policy_assistant/evaluate.py`)
+Evaluated on Grace's 67-question benchmark (59 answerable questions with relevant passages, `top 5`, `audience=staff`):
+
+| Method | `hit@5` | `MRR@5` | Notes |
+|---|---:|---:|---|
+| `bm25` | 0.831 | 0.655 | Strong on `exact-code` (1.000 / 0.955), weaker on `table` (0.625 / 0.354) |
+| `hybrid` (BM25 + Dense + RRF) | 0.864 | 0.745 | Combines lexical and semantic signals across languages |
+| `rerank` (Hybrid top-20 → Cross-Encoder) | **0.898** | **0.831** | Achieves 1.000 / 1.000 on `exact-code`, `contradiction`, and `staff-only` |
+| `rerank --rewrite` (recorded `chat-small`) | **0.932** | **0.882** | Lifts `table` to 1.000 / 0.938; kept opt-in due to latency and edge cases (e.g., Q60 Quebec French doc) |
 
 ---
 
 ## Repository Structure
 
 ```
+├── .env.example                    # Configuration template (mock, Ollama, or OpenAI-compatible API)
 ├── corpus/
-│   ├── documents/          # 36 enterprise policy documents (MD, HTML, PDF)
-│   ├── formats/            # Parallel document formats for parser benchmarking
-│   └── inventory.csv       # Document registry (versions, dates, access, languages)
+│   ├── documents/                  # 36 enterprise policy documents (MD, HTML, PDF)
+│   ├── formats/                    # Parallel document formats for parser benchmarking
+│   └── inventory.csv               # Document registry (versions, dates, access, languages)
 ├── questions/
-│   └── questions.jsonl     # Benchmark dataset of 67 real-world test queries
+│   └── questions.jsonl             # Benchmark dataset of 67 real-world test queries
 ├── recordings/
-│   └── embeddings_embed-small.npz  # Pre-recorded embeddings for offline testing
+│   ├── embeddings_embed-small.npz  # Pre-recorded embeddings for offline testing
+│   └── rewrites.jsonl              # Pre-recorded query rewrites for reproducible evaluation
 ├── policy_assistant/
 │   ├── __init__.py
-│   ├── __main__.py         # Central CLI dispatcher
-│   ├── parse.py            # Multi-format document parser
-│   ├── chunk.py            # Chunking algorithms (fixed, overlap, structure)
-│   ├── documents.py        # Inventory and corpus loader
-│   ├── metadata.py         # Data models and chunk schemas
-│   ├── store.py            # SQLite index manager (FTS5 + Vector store)
-│   ├── lexical.py          # BM25 Keyword Search
-│   ├── dense.py            # NumPy Vector Cosine Similarity Search
-│   ├── embed.py            # Embedding model adapters (Local, Recorded, OpenAI)
-│   └── evaluate.py         # Retrieval evaluation engine (Hit@k)
-├── tests/                  # Pytest test suite (31 automated unit tests)
-├── requirements.txt        # Python dependencies (Python >= 3.12)
+│   ├── __main__.py                 # Central CLI dispatcher
+│   ├── config.py                   # .env loader, Settings, prompt loader, provider factory
+│   ├── providers.py                # MockProvider & OpenAICompatibleProvider
+│   ├── prompts/
+│   │   └── rewrite.md              # System/user prompt for query rewriting
+│   ├── parse.py                    # Multi-format document parser
+│   ├── chunk.py                    # Chunking algorithms (fixed, overlap, structure)
+│   ├── documents.py                # Inventory and corpus loader
+│   ├── metadata.py                 # Data models and chunk schemas
+│   ├── store.py                    # SQLite index manager (FTS5 + Vector store)
+│   ├── filters.py                  # Temporal (as_of) and access (staff/public) filters
+│   ├── lexical.py                  # BM25 Keyword Search (SQLite FTS5)
+│   ├── dense.py                    # NumPy Vector Cosine Similarity Search
+│   ├── embed.py                    # Embedding model adapters (Local, Recorded, OpenAI)
+│   ├── hybrid.py                   # Reciprocal Rank Fusion (RRF)
+│   ├── rerank.py                   # Multilingual Cross-Encoder reranker
+│   ├── rewrite.py                  # Optional LLM query rewriting
+│   ├── search.py                   # Unified Retriever funnel
+│   └── evaluate.py                 # Retrieval evaluation engine (Hit@k & MRR@k)
+├── tests/                          # Automated Pytest test suite
+├── requirements.txt                # Python dependencies (Python >= 3.12)
 └── pytest.ini
 ```
 
@@ -137,15 +166,24 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-### Verification & Testing
+### Configuration (Optional — for live LLM query rewriting)
 
-Run the automated test suite:
+By default, the assistant uses `ASSISTANT_PROVIDER=mock` and requires no API keys. To use a live LLM (Ollama, Google Gemini, OpenAI, etc.), copy `.env.example` to `.env` (never committed to git) and set:
 
-```bash
-python -m pytest
+```env
+ASSISTANT_PROVIDER=openai_compatible
+ASSISTANT_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+ASSISTANT_MODEL=gemini-3.5-flash-lite
+ASSISTANT_API_KEY=<your_api_key>
 ```
 
-All 31 unit tests should pass.
+### Verification & Testing
+
+Run the automated test suite (forcing `mock` ensures offline, deterministic runs):
+
+```bash
+ASSISTANT_PROVIDER=mock ASSISTANT_MODEL=chat-small python -m pytest
+```
 
 ---
 
@@ -157,28 +195,31 @@ The system exposes a unified CLI via `python -m policy_assistant`:
 # Inspect the document inventory
 python -m policy_assistant inventory
 
-# Test the parser on a specific file
-python -m policy_assistant parse corpus/documents/Acceptable-use-policy.md
-
 # Build the index with structural chunking and vector embeddings
 python -m policy_assistant ingest --chunker structure --embedder intfloat/multilingual-e5-small
 
 # Inspect chunking results for a document
 python -m policy_assistant chunks warranty-policy
 
-# Perform lexical (BM25) search
-python -m policy_assistant search "What is the warranty period for garden tools?" --k 5
+# Search with cross-encoder reranking (default method), date filter, and audience gating
+python -m policy_assistant search "Combien de temps dure la garantie d'un barbecue?" --method rerank --k 5
+python -m policy_assistant search "return window" --method hybrid --as-of 2026-10-09 --audience public
 
-# Evaluate Hit@k on the 67-question benchmark
-python -m policy_assistant eval --k 5
+# Search with optional LLM query rewriting
+python -m policy_assistant search "Puis-je retourner une carte-cadeau?" --method rerank --rewrite
+
+# Evaluate Hit@k and MRR@k on the 67-question benchmark
+python -m policy_assistant eval --method rerank --k 5
+ASSISTANT_PROVIDER=mock ASSISTANT_MODEL=chat-small python -m policy_assistant eval --method rerank --rewrite
 ```
 
 ---
 
 ## Next Steps
 
-- [ ] Add **Cross-Encoder Reranking** (`cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`).
-- [ ] Build the **Generation & Citation Layer** with verifiable attribution and refusal triggers.
+- [x] Add **Cross-Encoder Reranking** (`cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`).
+- [x] Add optional **LLM Query Rewriting** and `MRR@k` retrieval evaluation.
+- [ ] Build the **Generation & Citation Layer** (Module 4) with verifiable attribution and refusal triggers.
 - [ ] Evaluate end-to-end question answering pipeline against Grace's reference benchmarks.
 
 ---
